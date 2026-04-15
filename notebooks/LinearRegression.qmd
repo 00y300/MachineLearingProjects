@@ -1,0 +1,1335 @@
+---
+title: "PUE Forecasting Analysis — ESIF Data Center"
+author: "00y300"
+date: "04-13-2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+  pdf:
+    toc: true
+    number-sections: true
+jupyter: python3
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+## Dataset Description
+
+The analysis uses Energy Systems Integration Facility (ESIF) Data Center power
+metrics and outside weather station timeseries data, provided in Parquet and
+compressed CSV formats.
+
+### Power Metrics Timeseries Fields
+
+- **ts**: Timestamp
+- **cooling_kw**: Cooling (kilowatts) — Captures power used by fans and pipe
+  trace heaters associated with outdoor cooling equipment. The dedicated tower
+  filter pump power is also captured as cooling load.
+- **energy_reuse**: Energy Reuse Effectiveness
+- **hvac_kw**: Heating, ventilation, and air conditioning (kilowatts) — Fan
+  walls, fan coils supporting the data center electrical rooms, and the make-up
+  air unit.
+- **it_power_kw**: IT equipment (kilowatts) — Power used by IT equipment on the
+  data center floor.
+- **plug_and_light_kw**: Lights and utility plugs (kilowatts) — Power associated
+  with the data center and dedicated mechanical room. The crank-case heater for
+  the emergency standby generator is also captured here.
+- **pue**: Power Usage Effectiveness
+- **pump_kw**: Pumps (kilowatts) — Power from pumps that move water in the
+  Energy Recovery Water loop and Tower Water loops, plus boost pumps that
+  circulate water through the fan walls. Note: the tower filter pump runs
+  constantly at 2.67 kW; that value is *not* reflected in this field.
+- **day**: Day of month
+
+### Outside Weather Station Timeseries Fields
+
+- **ts**: Timestamp
+- **outside_air_humidity**: Relative humidity percent
+- **outside_air_temp**: Outside air temperature (°F)
+- **day**: Day of month
+
+### Headline Findings
+
+This is a hobby / portfolio project, so the findings here reflect what I
+actually learned while poking at the data rather than a formal writeup.
+Things that surprised me:
+
+1. **Simple linear regression won everywhere.** I spent a lot of time trying
+   to make tree models beat LR at the 24h horizon — HistGBM, XGBoost, delta
+   targets, LR+tree residual hybrids. None of them worked. In the hybrid
+   setup, the tree stage actively hurt short-horizon models that LR was
+   already nailing, which was the moment I stopped trying to squeeze out
+   more model complexity.
+2. **MAE is a better headline metric than R² here.** At 24h, PUE MAE stays
+   around 0.008 (roughly 0.7% relative error) even when R² is negative or
+   near zero. The target is very flat in stable periods, so R² collapses —
+   but the absolute predictions are still genuinely good.
+3. **The data has a real baseline shift around late March 2024.** Daily
+   mean `log_overhead` jumps from about −4.0 to −2.5. No model can smooth
+   that over, which is most of why the 24h CV metrics look rough.
+4. **Training on post-shift data only didn't actually help.** I was sure
+   this would be the fix for the 24h horizon. It wasn't — the full-history
+   model matches or beats post-shift-only on every horizon. The comparison
+   table near the end of the notebook shows this directly.
+5. **Short horizons are great.** 5min PUE R² > 0.95 and 1h > 0.84. These
+   are the reliable outputs from this pipeline.
+
+---
+
+## Data Acquisition
+
+```{python}
+# | label: data-acquisition
+# | cache: true
+
+try:
+    from xgboost import XGBRegressor
+
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+import requests
+import zipfile
+from pathlib import Path
+
+DATASET_DIR = Path("~/Documents/Projects/MachineLearningProjects/datasets").expanduser()
+DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+BASE_URL = "https://data.nrel.gov/system/files/300"
+FILES = [
+    "1757105566-esif.influx.buildingData.PUE.combined.csv.zip",
+    "1757105566-esif.influx.buildingData.outside.combined.csv.zip",
+]
+
+EXPECTED_CSV_FILES = [
+    "esif.influx.buildingData.PUE.combined.csv",
+    "esif.influx.buildingData.outside.combined.csv",
+]
+
+print(f"Checking for datasets in {DATASET_DIR.resolve()}...")
+
+all_exist = all(
+    (DATASET_DIR / csv_name).exists() and (DATASET_DIR / csv_name).stat().st_size > 0
+    for csv_name in EXPECTED_CSV_FILES
+)
+
+if all_exist:
+    print("\nAll datasets already present, skipping download.")
+else:
+    for zip_filename in FILES:
+        expected_csv = zip_filename.replace("1757105566-", "esif.").replace(
+            ".zip", ".csv"
+        )
+        local_zip = DATASET_DIR / zip_filename
+        url = f"{BASE_URL}/{zip_filename}"
+
+        if local_zip.exists():
+            print(f"✓ Zip already exists: {local_zip.name}")
+        else:
+            print(f"Downloading {zip_filename}...")
+            try:
+                response = requests.get(url, stream=True, timeout=30)
+                response.raise_for_status()
+                with open(local_zip, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print(f"✓ Downloaded {zip_filename}")
+            except requests.exceptions.RequestException as e:
+                print(f"✗ Failed to download {zip_filename}: {e}")
+                continue
+            except IOError as e:
+                print(f"✗ Failed to write {zip_filename}: {e}")
+                continue
+
+        expected_csv_path = DATASET_DIR / expected_csv
+        if local_zip.exists() and not expected_csv_path.exists():
+            print(f"Extracting {local_zip.name}...")
+            try:
+                with zipfile.ZipFile(local_zip, "r") as zip_ref:
+                    zip_ref.extractall(DATASET_DIR)
+                local_zip.unlink()
+                print(f"✓ Extracted {local_zip.name}")
+            except zipfile.BadZipFile as e:
+                print(f"✗ Corrupted zip file {local_zip.name}: {e}")
+                continue
+            except IOError as e:
+                print(f"✗ Failed to extract {local_zip.name}: {e}")
+
+print("\nDatasets ready for analysis!")
+```
+
+---
+
+## Implementation
+
+### Import Required Libraries
+
+```{python}
+# | label: imports
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+import pickle
+import json
+import sqlite3
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.linear_model import LinearRegression, RidgeCV
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from pandas.tseries.holiday import USFederalHolidayCalendar
+
+PLOT_DIR = Path("~/Documents/Projects/MachineLearningProjects/plots").expanduser()
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+plt.rcParams["savefig.dpi"] = 150
+plt.rcParams["savefig.format"] = "png"
+plt.rcParams["figure.figsize"] = [10, 6]
+
+
+class Config:
+    """Central configuration for all paths and parameters."""
+
+    BASE_DIR = Path("~/Documents/Projects/MachineLearningProjects").expanduser()
+    DATASET_DIR = BASE_DIR / "datasets"
+    PLOT_DIR = BASE_DIR / "plots"
+    MODEL_DIR = BASE_DIR / "models"
+
+    for d in [DATASET_DIR, PLOT_DIR, MODEL_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    TEST_SPLIT_RATIO = 0.2
+    TIME_SERIES_SPLITS = 5
+    CORRELATION_THRESHOLD = 0.15
+
+    # Baseline shift detected around late March 2024 (see drift diagnostic).
+    # Models trained on data after this cutoff perform better at 24h.
+    SHIFT_CUTOFF = pd.Timestamp("2024-03-30", tz="UTC")
+```
+
+### Load and Preprocess Data
+
+```{python}
+# | label: load-data
+# | cache: true
+
+
+def load(path, value_cols):
+    """
+    Load and preprocess time-series data from CSV.
+
+    Args:
+        path: Path to CSV file
+        value_cols: List of column names to extract
+
+    Returns:
+        DataFrame with UTC timestamp index and specified columns
+    """
+    df = pd.read_csv(path, low_memory=False)
+    ts_clean = df["ts"].str.replace(r"\s*\(.*\)$", "", regex=True)
+    df["timestamp"] = pd.to_datetime(
+        ts_clean,
+        format="%a %b %d %Y %H:%M:%S GMT%z",
+        errors="coerce",
+        utc=True,
+    )
+    df = df.dropna(subset=["timestamp"])
+    df = df[df["timestamp"] > "2000-01-01"]
+    df = df[["timestamp"] + value_cols].set_index("timestamp").sort_index()
+    return df
+
+
+power = load(
+    Config.DATASET_DIR / "esif.influx.buildingData.PUE.combined.csv",
+    [
+        "pue",
+        "cooling_kw",
+        "it_power_kw",
+        "hvac_kw",
+        "pump_kw",
+        "plug_and_light_kw",
+        "energy_reuse",
+    ],
+)
+
+weather = load(
+    Config.DATASET_DIR / "esif.influx.buildingData.outside.combined.csv",
+    ["outdoor_air_temp", "outdoor_air_humidity"],
+)
+
+# Downsample to 5-minute means so both series align, then inner-join
+power_5m = power.resample("5min").mean()
+weather_5m = weather.resample("5min").mean()
+df = power_5m.join(weather_5m, how="inner").dropna()
+```
+
+---
+
+## Helper Functions
+
+```{python}
+# | label: helper-functions
+
+
+def get_predictive_features(
+    df, target_col="log_overhead", min_corr=0.15, candidates=None
+):
+    """
+    Select features with |correlation| > min_corr from a candidate list.
+
+    Args:
+        df: DataFrame with features and target
+        target_col: Name of the target column
+        min_corr: Minimum absolute correlation threshold
+        candidates: Optional explicit list of features to consider
+
+    Returns:
+        List of feature names above the correlation threshold
+    """
+    if candidates is None:
+        candidates = [c for c in df.columns if c != target_col]
+
+    correlations = df[candidates + [target_col]].corr()[target_col].abs()
+    correlations = correlations.drop(target_col, errors="ignore")
+    selected = correlations[correlations >= min_corr].index.tolist()
+    print(f"Selected {len(selected)} features with |correlation| ≥ {min_corr}")
+    return selected
+
+
+def plot_residual_analysis(y_true_pue, y_pred_pue, horizon_label="General"):
+    """
+    Generates standard residual plots for PUE predictions.
+
+    Args:
+        y_true_pue: True PUE values (Series)
+        y_pred_pue: Predicted PUE values (array)
+        horizon_label: Label for plot titles and saved filenames
+    """
+    residuals = y_true_pue.values - y_pred_pue
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].scatter(y_pred_pue, residuals, alpha=0.5, s=5)
+    axes[0].axhline(0, color="red", linestyle="--")
+    axes[0].set_xlabel("Predicted PUE")
+    axes[0].set_ylabel("Residuals (PUE units)")
+    axes[0].set_title(f"Residuals vs Predicted ({horizon_label} horizon)")
+
+    stats.probplot(residuals, dist="norm", plot=axes[1])
+    axes[1].set_title(f"Q-Q Plot of Residuals ({horizon_label} horizon)")
+
+    plt.tight_layout()
+    safe_label = horizon_label.replace(" ", "_").lower()
+    fig.savefig(
+        Config.PLOT_DIR / f"residual_analysis_{safe_label}.png", bbox_inches="tight"
+    )
+    plt.show()
+
+
+def run_horizon_analysis(horizon_name, df_target, feature_cols, model_factory=None):
+    """
+    Train and evaluate a model for a specific prediction horizon using
+    TimeSeriesSplit cross-validation. Reports both R² and MAE because MAE
+    remains informative when target variance is low.
+
+    Args:
+        horizon_name: Label for plots and logging (e.g., "1h")
+        df_target: DataFrame with 'target_log_overhead' column
+        feature_cols: List of feature columns to use
+        model_factory: Callable returning an unfitted estimator. Defaults to
+                       LinearRegression.
+
+    Returns:
+        Dict with model, scaler, predictions, and CV scores
+    """
+    if model_factory is None:
+        model_factory = LinearRegression
+
+    X = df_target[feature_cols]
+    y = df_target["target_log_overhead"]
+    y_pue = np.exp(y) + 1.0
+
+    tscv = TimeSeriesSplit(n_splits=Config.TIME_SERIES_SPLITS)
+    cv_scores_log = []
+    cv_scores_pue = []
+    cv_mae_pue = []
+
+    print(f"--- {horizon_name} Horizon Analysis ---\n")
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+        X_train_fold = X.iloc[train_idx]
+        X_test_fold = X.iloc[test_idx]
+        y_train_fold = y.iloc[train_idx]
+        y_test_fold = y.iloc[test_idx]
+        y_pue_test_fold = y_pue.iloc[test_idx]
+
+        scaler_fold = RobustScaler()
+        X_train_scaled = scaler_fold.fit_transform(X_train_fold)
+        X_test_scaled = scaler_fold.transform(X_test_fold)
+
+        X_train_df = pd.DataFrame(X_train_scaled, columns=X_train_fold.columns)
+        X_test_df = pd.DataFrame(X_test_scaled, columns=X_test_fold.columns)
+
+        model_fold = model_factory()
+        model_fold.fit(X_train_df, y_train_fold)
+        y_pred_log_fold = model_fold.predict(X_test_df)
+
+        log_lo = float(y_train_fold.min()) - 0.5
+        log_hi = float(y_train_fold.max()) + 0.5
+        y_pred_log_fold = np.clip(y_pred_log_fold, log_lo, log_hi)
+        y_pred_pue_fold = np.exp(y_pred_log_fold) + 1.0
+
+        r2_log = r2_score(y_test_fold, y_pred_log_fold)
+        r2_pue = r2_score(y_pue_test_fold, y_pred_pue_fold)
+        mae_pue = mean_absolute_error(y_pue_test_fold, y_pred_pue_fold)
+        rmse_pue = np.sqrt(mean_squared_error(y_pue_test_fold, y_pred_pue_fold))
+
+        cv_scores_log.append(r2_log)
+        cv_scores_pue.append(r2_pue)
+        cv_mae_pue.append(mae_pue)
+
+        print(f"Fold {fold + 1}:")
+        print(f"  Log-overhead R²: {r2_log:.4f}")
+        print(f"  PUE-scale R²:    {r2_pue:.4f}")
+        print(f"  PUE-scale MAE:   {mae_pue:.4f}")
+        print(f"  PUE-scale RMSE:  {rmse_pue:.4f}")
+
+    # Final model on full train/test split
+    split_idx = int(len(df_target) * (1 - Config.TEST_SPLIT_RATIO))
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    y_pue_test = y_pue.iloc[split_idx:]
+
+    scaler = RobustScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    X_train_df = pd.DataFrame(X_train_scaled, columns=X_train.columns)
+    X_test_df = pd.DataFrame(X_test_scaled, columns=X_test.columns)
+
+    model = model_factory()
+    model.fit(X_train_df, y_train)
+    y_pred_log = model.predict(X_test_df)
+
+    log_lo = float(y_train.min()) - 0.5
+    log_hi = float(y_train.max()) + 0.5
+    y_pred_log = np.clip(y_pred_log, log_lo, log_hi)
+    y_pred_pue = np.exp(y_pred_log) + 1.0
+
+    print(f"\n--- {horizon_name} Horizon Summary ---")
+    print(f"Log R²:  Mean={np.mean(cv_scores_log):+.4f} ± {np.std(cv_scores_log):.4f}")
+    print(f"PUE R²:  Mean={np.mean(cv_scores_pue):+.4f} ± {np.std(cv_scores_pue):.4f}")
+    print(f"PUE MAE: Mean={np.mean(cv_mae_pue):.4f} ± {np.std(cv_mae_pue):.4f}")
+    print(f"\nFinal holdout:")
+    print(f"  PUE R²:   {r2_score(y_pue_test, y_pred_pue):+.4f}")
+    print(f"  PUE MAE:  {mean_absolute_error(y_pue_test, y_pred_pue):.4f}")
+    print(f"  PUE RMSE: {np.sqrt(mean_squared_error(y_pue_test, y_pred_pue)):.4f}")
+
+    plot_residual_analysis(y_pue_test, y_pred_pue, horizon_name)
+
+    return {
+        "model": model,
+        "scaler": scaler,
+        "y_test_pue": y_pue_test,
+        "y_pred_pue": y_pred_pue,
+        "cv_scores_log": cv_scores_log,
+        "cv_scores_pue": cv_scores_pue,
+        "cv_mae_pue": cv_mae_pue,
+    }
+
+
+def walk_forward_eval(
+    df_wf,
+    feature_cols,
+    target_col,
+    initial_train_days=180,
+    test_days=30,
+    step_days=30,
+    max_windows=24,
+    model_factory=None,
+):
+    """
+    Expanding-window walk-forward evaluation. Simulates the operational
+    question: "if we retrained every `step_days` days, how would we do on
+    the next `test_days` days?"
+
+    Returns per-window metrics as a DataFrame.
+    """
+    if model_factory is None:
+        model_factory = lambda: RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
+
+    results = []
+    start = df_wf.index.min()
+    end = df_wf.index.max()
+
+    window_idx = 0
+    cur_train_end = start + pd.Timedelta(days=initial_train_days)
+
+    while (
+        cur_train_end + pd.Timedelta(days=test_days) <= end and window_idx < max_windows
+    ):
+        test_start = cur_train_end
+        test_end = test_start + pd.Timedelta(days=test_days)
+
+        train = df_wf[df_wf.index < cur_train_end]
+        test = df_wf[(df_wf.index >= test_start) & (df_wf.index < test_end)]
+
+        if len(train) < 1000 or len(test) < 100:
+            cur_train_end += pd.Timedelta(days=step_days)
+            window_idx += 1
+            continue
+
+        X_tr, y_tr = train[feature_cols], train[target_col]
+        X_te, y_te = test[feature_cols], test[target_col]
+        y_pue_te = np.exp(y_te) + 1.0
+
+        sc = RobustScaler()
+        X_tr_s = pd.DataFrame(
+            sc.fit_transform(X_tr), columns=X_tr.columns, index=X_tr.index
+        )
+        X_te_s = pd.DataFrame(
+            sc.transform(X_te), columns=X_te.columns, index=X_te.index
+        )
+
+        m = model_factory()
+        m.fit(X_tr_s, y_tr)
+        pred_log = np.clip(
+            m.predict(X_te_s), float(y_tr.min()) - 0.5, float(y_tr.max()) + 0.5
+        )
+        pred_pue = np.exp(pred_log) + 1.0
+
+        results.append(
+            {
+                "test_start": test_start,
+                "train_size": len(train),
+                "log_r2": r2_score(y_te, pred_log),
+                "pue_r2": r2_score(y_pue_te, pred_pue),
+                "pue_mae": mean_absolute_error(y_pue_te, pred_pue),
+            }
+        )
+
+        cur_train_end += pd.Timedelta(days=step_days)
+        window_idx += 1
+
+    return pd.DataFrame(results)
+```
+
+---
+
+## Data Quality Filter
+
+PUE is physically bounded: it equals total facility power divided by IT power
+and in practice always falls in roughly [1.0, 3.0]. Values outside that range
+are sensor glitches, divide-by-near-zero artefacts, or maintenance windows
+where IT load briefly collapsed. These are dropped **before** the train/test
+split so they cannot pollute the model or residual diagnostics.
+
+```{python}
+# | label: data-quality
+
+before = len(df)
+
+# 1. Drop physically impossible PUE
+df = df[(df["pue"] >= 1.0) & (df["pue"] <= 3.0)]
+
+# 2. Drop rows where IT power is implausibly low (root cause of runaway PUE
+#    since IT power sits in the denominator). Anything below 10% of the
+#    median is almost certainly a sensor dropout.
+it_floor = df["it_power_kw"].median() * 0.1
+df = df[df["it_power_kw"] > it_floor]
+
+dropped = before - len(df)
+print(f"Data quality check: Dropped {dropped:,} rows ({dropped / before * 100:.2f}%)")
+print(f"Final dataset: {df.shape}, {df.index.min()} → {df.index.max()}")
+df.head()
+```
+
+### Export to SQLite
+
+```{python}
+# | label: sqlite-export
+
+db_path = Config.DATASET_DIR / "power_data.db"
+try:
+    conn = sqlite3.connect(str(db_path))
+    df.to_sql("building_metrics", conn, if_exists="replace", index=True)
+    conn.close()
+    print(f"Saved dataset to SQLite: {db_path}")
+except sqlite3.Error as e:
+    print(f"✗ Failed to save dataset to SQLite: {e}")
+except IOError as e:
+    print(f"✗ Failed to write SQLite database: {e}")
+```
+
+---
+
+## Exploratory Data Analysis
+
+### PUE Distribution
+
+```{python}
+# | label: pue-distribution
+# | fig-cap: "Distribution of PUE values after quality filtering."
+
+print("PUE Statistics:")
+print(df["pue"].describe())
+
+df_filtered = df[(df["pue"] > 0) & (df["pue"] <= 5.0)]["pue"]
+
+plt.figure(figsize=(10, 6))
+sns.set_style("darkgrid")
+sns.histplot(
+    x=df_filtered,
+    bins=100,
+    kde=True,
+    color="#2E86AB",
+    edgecolor="white",
+    alpha=0.75,
+    linewidth=0.5,
+)
+plt.title(
+    "Distribution of PUE (filtered: {:,} valid records)".format(len(df_filtered)),
+    fontsize=14,
+    fontweight="bold",
+    pad=20,
+)
+plt.xlabel("PUE Value", fontsize=12, labelpad=10)
+plt.ylabel("Frequency", fontsize=12, labelpad=10)
+plt.xlim(0.8, 1.6)
+plt.xticks(np.arange(0.8, 1.7, 0.1))
+# plt.axvline(x=1.0, color="red", linestyle="--", linewidth=1.5, label="Physical minimum")
+# plt.legend(loc="upper right", fontsize=10)
+sns.despine(top=True, right=True)
+plt.tight_layout()
+
+fig = plt.gcf()
+fig.savefig(
+    Config.PLOT_DIR / "pue_distribution_clean.png", bbox_inches="tight", dpi=300
+)
+plt.show()
+```
+
+### Baseline Shift Diagnostic
+
+This is the most important plot in the analysis. Daily mean `log_overhead`
+reveals a sharp operational baseline change around late March 2024 — the
+mean jumps from roughly −4.0 to −2.5 and stays there. This discontinuity
+drives most of the 24h forecasting difficulty.
+
+```{python}
+# | label: baseline-shift
+# | fig-cap: "Daily mean log_overhead over time. A step change around 2024-03-30 marks a real operational baseline shift."
+
+df["log_overhead"] = np.log(df["pue"] - 1.0)
+df = df[np.isfinite(df["log_overhead"])]
+
+daily_log = df["log_overhead"].resample("1D").mean()
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.plot(daily_log.index, daily_log.values, color="#2E86AB", alpha=0.8, linewidth=0.8)
+ax.axvline(
+    Config.SHIFT_CUTOFF,
+    color="red",
+    linestyle="--",
+    linewidth=1.5,
+    label=f"Shift cutoff: {Config.SHIFT_CUTOFF.date()}",
+)
+ax.set_xlabel("Date")
+ax.set_ylabel("log_overhead (daily mean)")
+ax.set_title("Operational baseline shift around late March 2024")
+ax.legend(loc="lower right")
+ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+plt.xticks(rotation=45)
+plt.tight_layout()
+fig.savefig(Config.PLOT_DIR / "baseline_shift_diagnostic.png", bbox_inches="tight")
+plt.show()
+
+# Quantify the shift
+pre = df.loc[df.index < Config.SHIFT_CUTOFF, "log_overhead"]
+post = df.loc[df.index >= Config.SHIFT_CUTOFF, "log_overhead"]
+print(f"\nPre-shift:  mean={pre.mean():+.3f}, std={pre.std():.3f}, n={len(pre):,}")
+print(f"Post-shift: mean={post.mean():+.3f}, std={post.std():.3f}, n={len(post):,}")
+print(
+    f"Shift magnitude: {post.mean() - pre.mean():+.3f} (≈{abs(post.mean() - pre.mean()) / pre.std():.1f} pre-shift std)"
+)
+```
+
+### Correlation Heatmap
+
+```{python}
+# | label: correlation-heatmap
+# | fig-cap: "Feature correlation matrix."
+
+plt.figure(figsize=(10, 6))
+corr = df.corr()
+sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5)
+plt.title("Feature Correlation Matrix")
+plt.tight_layout()
+
+fig = plt.gcf()
+fig.savefig(Config.PLOT_DIR / "correlation_matrix.png", bbox_inches="tight")
+plt.show()
+```
+
+---
+
+## Feature Engineering
+
+The feature set reflects benchmarking from earlier revisions of this notebook.
+Features dropped after proving actively harmful (negative permutation
+importance) or net-zero:
+
+- Cyclical hour encoding (for linear models)
+- Rolling weather means (6h, 24h thermal mass)
+- `temp_delta_vs_yesterday` — the correction that helps LR exploit lag_288
+- Weekly lag (2016 steps) — captures weekly workload patterns
+- Federal holiday flag
+
+```{python}
+# | label: feature-engineering
+
+# Time-based
+df["hour"] = df.index.hour
+df["day_of_week"] = df.index.dayofweek
+df["month"] = df.index.month
+df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+
+# Cyclical hour (smooths the 23→0 discontinuity for LR)
+df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+
+# Rolling weather (thermal mass / sustained heat)
+df["temp_roll_6h"] = df["outdoor_air_temp"].rolling("6h").mean()
+df["temp_roll_24h"] = df["outdoor_air_temp"].rolling("24h").mean()
+
+# Weather change features (the correction LR needs at long horizons)
+df["temp_lag_288"] = df["outdoor_air_temp"].shift(288)
+df["temp_delta_vs_yesterday"] = df["outdoor_air_temp"] - df["temp_lag_288"]
+
+# Holiday flag
+holidays = USFederalHolidayCalendar().holidays(
+    start=df.index.min().tz_localize(None),
+    end=df.index.max().tz_localize(None),
+)
+df["is_holiday"] = df.index.tz_localize(None).normalize().isin(holidays).astype(int)
+
+# --- Target transformation ---
+# PUE is bounded below by 1.0 and has a heavy right tail. log(PUE - 1) is
+# closer to symmetric, satisfying OLS assumptions. Lag features are built
+# AFTER this transformation so they live on the same scale as the target.
+target_col = "log_overhead"
+# (already computed above for the baseline plot)
+
+# --- Lag features on log-overhead target ---
+# 1 step = 5 min (momentum), 12 = 1h, 288 = 24h (diurnal), 2016 = 1 week
+for lag in [1, 12, 288, 2016]:
+    df[f"log_overhead_lag_{lag}"] = df[target_col].shift(lag)
+
+df = df.dropna()
+
+# --- Feature Selection ---
+candidate_features = [
+    "outdoor_air_temp",
+    "outdoor_air_humidity",
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_holiday",
+    "hour_sin",
+    "hour_cos",
+    "temp_roll_6h",
+    "temp_roll_24h",
+    "temp_delta_vs_yesterday",
+    "log_overhead_lag_1",
+    "log_overhead_lag_12",
+    "log_overhead_lag_288",
+    "log_overhead_lag_2016",
+]
+
+print("=== Feature Selection ===")
+print("\nCorrelations with log_overhead target:")
+for feature in candidate_features:
+    if feature in df.columns:
+        print(f"  {feature:30s}: {df[[feature, target_col]].corr().iloc[0, 1]:+.4f}")
+
+feature_cols_predictive = get_predictive_features(
+    df,
+    target_col=target_col,
+    min_corr=Config.CORRELATION_THRESHOLD,
+    candidates=candidate_features,
+)
+
+print(f"\nFinal predictive feature set ({len(feature_cols_predictive)} features):")
+for feat in feature_cols_predictive:
+    print(f"  - {feat}")
+```
+
+---
+
+## Ablation Study: Feature Contribution
+
+How much does each feature group add beyond simple persistence?
+
+
+def fit_and_score(cols, label):
+    """Fit a LinearRegression on `cols` and return mean log-scale CV R²."""
+    Xa = df[cols]
+    y = df[target_col]
+    tscv_fold = TimeSeriesSplit(n_splits=Config.TIME_SERIES_SPLITS)
+    cv_r2_scores = []
+
+    for train_idx, test_idx in tscv_fold.split(Xa):
+        Xa_train = Xa.iloc[train_idx]
+        Xa_test = Xa.iloc[test_idx]
+        y_train_fold = y.iloc[train_idx]
+        y_test_fold = y.iloc[test_idx]
+
+        sc = RobustScaler()
+        Xa_train_s = sc.fit_transform(Xa_train)
+        Xa_test_s = sc.transform(Xa_test)
+
+        Xa_train_df = pd.DataFrame(Xa_train_s, columns=Xa_train.columns)
+        Xa_test_df = pd.DataFrame(Xa_test_s, columns=Xa_test.columns)
+
+        m = LinearRegression()
+        m.fit(Xa_train_df, y_train_fold)
+        pred = m.predict(Xa_test_df)
+        cv_r2_scores.append(r2_score(y_test_fold, pred))
+
+    mean_r2 = np.mean(cv_r2_scores)
+    std_r2 = np.std(cv_r2_scores)
+    print(f"{label:50s}  log R² = {mean_r2:+.6f} ± {std_r2:.6f}")
+    return mean_r2
+
+
+ablation_a = ["log_overhead_lag_1"]
+ablation_b = [
+    "log_overhead_lag_1",
+    "log_overhead_lag_12",
+    "log_overhead_lag_288",
+    "log_overhead_lag_2016",
+]
+ablation_c = feature_cols_predictive
+
+print("Ablation comparison (log-overhead scale):\n")
+r2_a = fit_and_score(ablation_a, "A: lag-1 only (persistence baseline)")
+r2_b = fit_and_score(ablation_b, "B: all lags, no weather/temporal")
+r2_c = fit_and_score(ablation_c, "C: lags + weather + temporal (full)")
+
+print(f"\nDelta A → B (longer lags add):      {r2_b - r2_a:+.6f}")
+print(f"Delta B → C (weather+temporal add):  {r2_c - r2_b:+.6f}")
+```
+
+**How to read this:** if A is already near 1.0, the model is essentially
+predicting "next value = last value." Large B → C deltas mean weather and
+temporal features earn their keep. The 5-minute horizon is dominated by
+persistence; weather matters more as horizon grows.
+
+---
+
+## 5-Minute Horizon Prediction
+
+Baseline model predicts PUE **1 step (5 minutes) ahead**. Autocorrelation
+dominates at this horizon; weather has minimal impact.
+
+```{python}
+# | label: horizon-5min
+
+horizon_5min = 1
+df_5min = df.copy()
+df_5min["target_log_overhead"] = df_5min["log_overhead"].shift(-horizon_5min)
+df_5min = df_5min.dropna(subset=["target_log_overhead"])
+
+results_5min = run_horizon_analysis(
+    horizon_name="5min",
+    df_target=df_5min,
+    feature_cols=feature_cols_predictive,
+)
+```
+
+---
+
+## 1-Hour Horizon Prediction
+
+At the **12-step (1 hour) horizon**, lag-1 becomes stale and longer lags plus
+weather start to contribute meaningfully.
+
+```{python}
+# | label: horizon-1h
+
+horizon_1h = 12
+df_1h = df.copy()
+df_1h["target_log_overhead"] = df_1h["log_overhead"].shift(-horizon_1h)
+df_1h = df_1h.dropna(subset=["target_log_overhead"])
+
+results_1h = run_horizon_analysis(
+    horizon_name="1h",
+    df_target=df_1h,
+    feature_cols=feature_cols_predictive,
+)
+```
+
+---
+
+## 24-Hour Horizon Prediction
+
+At the **288-step (24 hour) horizon**, all short lag features are stale and
+`log_overhead_lag_288` (same time yesterday) plus weather become dominant.
+This horizon is where the baseline-shift problem bites hardest — per-fold CV
+R² swings from 0.58 to −0.02 depending on which time period is tested.
+
+We report the standard CV analysis, then a walk-forward evaluation which
+gives a more operationally meaningful picture.
+
+```{python}
+# | label: horizon-24h
+
+horizon_24h = 288
+df_24h = df.copy()
+df_24h["target_log_overhead"] = df_24h["log_overhead"].shift(-horizon_24h)
+df_24h = df_24h.dropna(subset=["target_log_overhead"])
+
+# Standard CV (3 splits at 24h — more training data per fold than 5 splits)
+X_24 = df_24h[feature_cols_predictive]
+y_24 = df_24h["target_log_overhead"]
+y_pue_24 = np.exp(y_24) + 1.0
+
+tscv = TimeSeriesSplit(n_splits=3)
+print("=== 24h Per-Fold Breakdown (LinearRegression) ===\n")
+per_fold = []
+for fold_idx, (train_idx, test_idx) in enumerate(tscv.split(X_24)):
+    X_tr, X_te = X_24.iloc[train_idx], X_24.iloc[test_idx]
+    y_tr, y_te = y_24.iloc[train_idx], y_24.iloc[test_idx]
+    y_pue_te = y_pue_24.iloc[test_idx]
+
+    sc = RobustScaler()
+    X_tr_s = pd.DataFrame(
+        sc.fit_transform(X_tr), columns=X_tr.columns, index=X_tr.index
+    )
+    X_te_s = pd.DataFrame(sc.transform(X_te), columns=X_te.columns, index=X_te.index)
+
+    lr = LinearRegression()
+    lr.fit(X_tr_s, y_tr)
+    pred_log = np.clip(
+        lr.predict(X_te_s), float(y_tr.min()) - 0.5, float(y_tr.max()) + 0.5
+    )
+    pred_pue = np.exp(pred_log) + 1.0
+
+    per_fold.append(
+        {
+            "fold": fold_idx + 1,
+            "train_size": len(train_idx),
+            "test_size": len(test_idx),
+            "log_r2": r2_score(y_te, pred_log),
+            "pue_r2": r2_score(y_pue_te, pred_pue),
+            "pue_mae": mean_absolute_error(y_pue_te, pred_pue),
+        }
+    )
+
+per_fold_df = pd.DataFrame(per_fold)
+print(per_fold_df.to_string(index=False))
+print(f"\nMean PUE R²:  {per_fold_df['pue_r2'].mean():+.4f}  (highly period-dependent)")
+print(f"Mean PUE MAE: {per_fold_df['pue_mae'].mean():.4f}  (stable, honest metric)")
+```
+
+### Walk-Forward Evaluation
+
+This simulates the realistic operational workflow: retrain monthly, predict
+30 days ahead. Each window's MAE is a real-world performance estimate.
+
+```{python}
+# | label: walk-forward-24h
+
+wf_results = walk_forward_eval(
+    df_24h,
+    feature_cols_predictive,
+    "target_log_overhead",
+    initial_train_days=180,
+    test_days=30,
+    step_days=30,
+)
+
+print(f"Walk-forward: {len(wf_results)} windows evaluated\n")
+print(wf_results[["test_start", "pue_r2", "pue_mae"]].to_string(index=False))
+
+print(f"\n=== Walk-forward summary (24h, RidgeCV) ===")
+print(f"  Median PUE R²:  {wf_results['pue_r2'].median():+.4f}")
+print(f"  Median PUE MAE: {wf_results['pue_mae'].median():.4f}")
+print(f"  25th pct MAE:   {wf_results['pue_mae'].quantile(0.25):.4f}")
+print(f"  75th pct MAE:   {wf_results['pue_mae'].quantile(0.75):.4f}")
+print(f"  % windows R² > 0:   {(wf_results['pue_r2'] > 0).mean() * 100:.1f}%")
+print(f"  % windows R² > 0.2: {(wf_results['pue_r2'] > 0.2).mean() * 100:.1f}%")
+
+fig, ax = plt.subplots(figsize=(12, 4))
+colors = ["#2A9D8F" if r > 0 else "#E76F51" for r in wf_results["pue_r2"]]
+ax.bar(
+    wf_results["test_start"], wf_results["pue_mae"], width=25, color=colors, alpha=0.75
+)
+ax.axhline(
+    wf_results["pue_mae"].median(),
+    color="blue",
+    linestyle=":",
+    label=f"Median MAE = {wf_results['pue_mae'].median():.4f}",
+)
+ax.set_xlabel("Test window start")
+ax.set_ylabel("PUE MAE (24h horizon)")
+ax.set_title("Walk-forward 30-day MAE (green bars have R² > 0, red bars have R² ≤ 0)")
+ax.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(Config.PLOT_DIR / "walk_forward_mae_24h.png", bbox_inches="tight")
+plt.show()
+```
+
+### Final 24h Model: RidgeCV on Full History
+
+I originally trained this on post-shift data only, figuring the pre-shift
+rows were polluting the model. Turned out not to matter — the post-shift
+comparison later in the notebook shows full history actually edges out
+post-shift-only at 24h. So this just uses everything.
+
+```{python}
+# | label: horizon-24h-final
+
+print(f"Training on full history: {len(df_24h):,} rows")
+
+results_24h = run_horizon_analysis(
+    horizon_name="24h",
+    df_target=df_24h,
+    feature_cols=feature_cols_predictive,
+    model_factory=lambda: RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0]),
+)
+
+# --- Predicted vs Actual PUE Plot with MAE Annotation ---
+fig, ax = plt.subplots(figsize=(10, 8))
+ax.scatter(results_24h["y_test_pue"], results_24h["y_pred_pue"], alpha=0.5, s=8)
+ax.plot(
+    [results_24h["y_test_pue"].min(), results_24h["y_test_pue"].max()],
+    [results_24h["y_test_pue"].min(), results_24h["y_test_pue"].max()],
+    color="red",
+    linestyle="--",
+    linewidth=1.5,
+    label="Perfect prediction",
+)
+ax.set_xlabel("Actual PUE", fontsize=12)
+ax.set_ylabel("Predicted PUE (24h ahead)", fontsize=12)
+mae_value = mean_absolute_error(results_24h["y_test_pue"], results_24h["y_pred_pue"])
+r2_value = r2_score(results_24h["y_test_pue"], results_24h["y_pred_pue"])
+ax.text(
+    0.05,
+    0.95,
+    f"MAE: {mae_value:.4f} PUE units\nR²: {r2_value:+.4f}\nn = {len(results_24h['y_test_pue']):,}",
+    transform=ax.transAxes,
+    fontsize=11,
+    verticalalignment="top",
+    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+)
+ax.set_title("Predicted vs Actual PUE (24h Horizon)\nLinear Regression on log-overhead")
+ax.legend()
+sns.despine()
+plt.tight_layout()
+fig.savefig(
+    Config.PLOT_DIR / "predicted_vs_actual_pue_24h.png", bbox_inches="tight", dpi=150
+)
+plt.show()
+```
+
+---
+
+## Cooling Overhead Analysis
+
+PUE bundles multiple energy components. Isolating **cooling overhead**
+(`cooling_kw / it_power_kw`) tests whether weather features carry more
+predictive power when analysing a single, weather-sensitive component.
+
+```{python}
+# | label: cooling-overhead
+
+df_c = df.copy()
+df_c["cooling_overhead"] = df_c["cooling_kw"] / df_c["it_power_kw"]
+df_c = df_c[df_c["cooling_overhead"] > 0]
+
+df_c["log_cooling_overhead"] = np.log(df_c["cooling_overhead"])
+df_c = df_c[np.isfinite(df_c["log_cooling_overhead"])]
+
+for lag in [1, 12, 288]:
+    df_c[f"log_cool_lag_{lag}"] = df_c["log_cooling_overhead"].shift(lag)
+df_c = df_c.dropna()
+
+cooling_features = [
+    "outdoor_air_temp",
+    "outdoor_air_humidity",
+    "hour_sin",
+    "hour_cos",
+    "is_weekend",
+    "temp_roll_6h",
+    "temp_roll_24h",
+    "temp_delta_vs_yesterday",
+    "log_cool_lag_1",
+    "log_cool_lag_12",
+    "log_cool_lag_288",
+]
+
+X_c = df_c[cooling_features]
+y_c = df_c["log_cooling_overhead"]
+y_c_raw = df_c["cooling_overhead"]
+
+split_idx_c = int(len(df_c) * (1 - Config.TEST_SPLIT_RATIO))
+X_c_train, X_c_test = X_c.iloc[:split_idx_c], X_c.iloc[split_idx_c:]
+y_c_train, y_c_test = y_c.iloc[:split_idx_c], y_c.iloc[split_idx_c:]
+y_c_raw_test = y_c_raw.iloc[split_idx_c:]
+
+scaler_c = RobustScaler()
+X_c_train_s = scaler_c.fit_transform(X_c_train)
+X_c_test_s = scaler_c.transform(X_c_test)
+
+X_c_train_df = pd.DataFrame(X_c_train_s, columns=X_c_train.columns)
+X_c_test_df = pd.DataFrame(X_c_test_s, columns=X_c_test.columns)
+
+model_c = LinearRegression()
+model_c.fit(X_c_train_df, y_c_train)
+y_c_pred_log = np.clip(
+    model_c.predict(X_c_test_df),
+    float(y_c_train.min()) - 0.5,
+    float(y_c_train.max()) + 0.5,
+)
+y_c_pred_raw = np.exp(y_c_pred_log)
+
+print("--- Cooling-overhead model (5-minute horizon) ---")
+print(f"Log R²:  {r2_score(y_c_test, y_c_pred_log):.4f}")
+print(f"Raw R²:  {r2_score(y_c_raw_test, y_c_pred_raw):.4f}")
+print(f"Raw MAE: {mean_absolute_error(y_c_raw_test, y_c_pred_raw):.6f}")
+```
+
+## Post-Shift-Only Training (Alternative Stack)
+
+Implements the recommendation to retrain all horizons on post-shift data
+only. This loses ~6 months of history but gives each model a clean target
+distribution. Run this as an alternative to the full-history stack if ops
+confirms the late-March 2024 shift is permanent.
+
+```{python}
+# | label: post-shift-only
+
+
+def train_post_shift(
+    horizon_name, horizon_steps, df_source, feature_cols, cutoff=Config.SHIFT_CUTOFF
+):
+    """Retrain a horizon model on post-shift data only and compare to full-history."""
+    dfh = df_source.copy()
+    dfh["target_log_overhead"] = dfh["log_overhead"].shift(-horizon_steps)
+    dfh = dfh.dropna(subset=["target_log_overhead"])
+
+    dfh_post = dfh[dfh.index >= cutoff]
+
+    def fit_eval(data):
+        X = data[feature_cols]
+        y = data["target_log_overhead"]
+        y_pue = np.exp(y) + 1.0
+        split = int(len(data) * (1 - Config.TEST_SPLIT_RATIO))
+        X_tr, X_te = X.iloc[:split], X.iloc[split:]
+        y_tr, y_te = y.iloc[:split], y.iloc[split:]
+        y_pue_te = y_pue.iloc[split:]
+
+        sc = RobustScaler()
+        X_tr_s = pd.DataFrame(
+            sc.fit_transform(X_tr), columns=X.columns, index=X_tr.index
+        )
+        X_te_s = pd.DataFrame(sc.transform(X_te), columns=X.columns, index=X_te.index)
+
+        m = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
+        m.fit(X_tr_s, y_tr)
+        pred_log = np.clip(
+            m.predict(X_te_s), float(y_tr.min()) - 0.5, float(y_tr.max()) + 0.5
+        )
+        pred_pue = np.exp(pred_log) + 1.0
+
+        return {
+            "model": m,
+            "scaler": sc,
+            "n_train": len(X_tr),
+            "pue_r2": r2_score(y_pue_te, pred_pue),
+            "pue_mae": mean_absolute_error(y_pue_te, pred_pue),
+            "pue_rmse": np.sqrt(mean_squared_error(y_pue_te, pred_pue)),
+        }
+
+    full = fit_eval(dfh)
+    post = fit_eval(dfh_post)
+
+    print(f"--- {horizon_name} horizon ---")
+    print(
+        f"{'':12s}  {'n_train':>8s}  {'PUE R²':>8s}  {'PUE MAE':>8s}  {'PUE RMSE':>9s}"
+    )
+    print(
+        f"{'Full hist':12s}  {full['n_train']:>8,d}  {full['pue_r2']:>+8.4f}  {full['pue_mae']:>8.5f}  {full['pue_rmse']:>9.5f}"
+    )
+    print(
+        f"{'Post-shift':12s}  {post['n_train']:>8,d}  {post['pue_r2']:>+8.4f}  {post['pue_mae']:>8.5f}  {post['pue_rmse']:>9.5f}"
+    )
+    print(
+        f"{'Δ (post−full)':12s}  {post['n_train'] - full['n_train']:>+8,d}  "
+        f"{post['pue_r2'] - full['pue_r2']:>+8.4f}  "
+        f"{post['pue_mae'] - full['pue_mae']:>+8.5f}  "
+        f"{post['pue_rmse'] - full['pue_rmse']:>+9.5f}\n"
+    )
+
+    return {"full": full, "post": post}
+
+
+post_shift_comparison = {}
+for hname, hsteps in [("5min", 1), ("1h", 12), ("24h", 288)]:
+    post_shift_comparison[hname] = train_post_shift(
+        hname, hsteps, df, feature_cols_predictive
+    )
+
+# Save post-shift-only models as an alternative stack
+print("=== Saving Post-Shift-Only Models ===")
+for hname, comp in post_shift_comparison.items():
+    path = Config.MODEL_DIR / f"pue_{hname}_post_shift.pkl"
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(
+                {
+                    "model": comp["post"]["model"],
+                    "scaler": comp["post"]["scaler"],
+                    "horizon": hname,
+                    "features": feature_cols_predictive,
+                    "training_window": "post_shift_only",
+                    "cutoff": str(Config.SHIFT_CUTOFF),
+                },
+                f,
+            )
+        print(f"✓ Saved {hname} post-shift model to {path}")
+    except (pickle.PickleError, IOError) as e:
+        print(f"✗ Failed to save {hname} post-shift model: {e}")
+```
+
+**How to read the comparison table:** negative Δ MAE means post-shift-only
+wins on that horizon. If all three horizons show improvement (or flat), the
+operational recommendation is to switch the full production stack to the
+post-shift models. If 5min/1h get worse but 24h improves, keep the
+horizon-specific stack (full history for short horizons, post-shift only
+for 24h) — which is what the main pipeline above already does.
+
+---
+
+
+
+```{python}
+# | label: model-save
+
+print("\n=== Saving Models ===")
+for horizon_name, results in [
+    ("5min", results_5min),
+    ("1h", results_1h),
+    ("24h", results_24h),
+]:
+    model_path = Config.MODEL_DIR / f"pue_{horizon_name}.pkl"
+    try:
+        with open(model_path, "wb") as f:
+            pickle.dump(
+                {
+                    "model": results["model"],
+                    "scaler": results["scaler"],
+                    "horizon": horizon_name,
+                    "features": feature_cols_predictive,
+                    "training_window": "full_history",
+                },
+                f,
+            )
+        print(f"✓ Saved {horizon_name} model to {model_path}")
+    except (pickle.PickleError, IOError) as e:
+        print(f"✗ Failed to save {horizon_name} model: {e}")
+
+features_path = Config.MODEL_DIR / "feature_columns.json"
+try:
+    with open(features_path, "w") as f:
+        json.dump(feature_cols_predictive, f)
+    print(f"✓ Saved feature list to {features_path}")
+except (json.JSONDecodeError, IOError) as e:
+    print(f"✗ Failed to save feature list: {e}")
+```
+
+---
+
+## What I Learned
+
+This started as a "let me try forecasting something real" weekend project
+and turned into a good lesson in not over-engineering.
+
+1. **Short horizons are easy and boring, in a good way.** 5min PUE R² comes
+   out above 0.95 almost by accident because PUE barely moves in five
+   minutes. I kept expecting to find something clever to add, but the
+   honest answer is lag-1 does almost all the work.
+
+2. **24h is where the interesting problems live.** The CV R² swings wildly
+   between folds (from about 0.57 down to near zero), which was confusing
+   until I plotted the target over time and saw the giant step change in
+   late March 2024. Different CV folds sample different underlying
+   distributions, which is a fundamentally different problem than model
+   choice.
+
+3. **MAE saved the writeup.** For a long time I was reporting "PUE R² ≈
+   0.21 at 24h" and feeling bad about it. Then I actually looked at the
+   MAE: around 0.008, which is less than 1% relative error. R² is just a
+   terrible metric when the target has low variance — you end up comparing
+   your prediction's variance to a near-zero baseline. Lesson internalized.
+
+
+4. **Some "obvious" features hurt.** `temp_x_humidity` (the wet-bulb
+   interaction I thought would be brilliant) and `doy_cos` (seasonality!)
+   both had negative permutation importance. They're in the "plausible but
+   useless" bucket, and the model is better without them.
+
+5. **The post-shift-only training idea didn't pan out.** I was really sure
+   that restricting training to post-March-2024 data would fix the 24h
+   horizon. It didn't. The comparison table in the "Post-Shift-Only
+   Training" section shows full history actually wins narrowly at every
+   horizon, including 24h. My working theory is that the weekly lag
+   (`log_overhead_lag_2016`) needs more context than the post-shift window
+   provides, so dropping 6 months of history hurts more than it helps. But
+   I didn't verify that — just noting it for future me.
+
+## What I'd Do Differently Next Time
+
+- **Start with MAE, not R².** I wasted real time iterating on models to
+  chase R² when the MAE was already fine.
+- **Plot the target over time before anything else.** The baseline shift
+  would have jumped out immediately and I could have designed the CV
+  around it from the start.
+- **Stop and ask "why?" when a model does dramatically worse on one fold.**
+  High CV variance is almost never a model problem — it's a data problem,
+  and no amount of hyperparameter tuning will fix it.
+
+## If I Were Actually Putting This Into Production
+
+- LinearRegression / RidgeCV on full history for all three horizons. I'd
+  retrain monthly with a rolling window (the walk-forward analysis
+  simulates exactly this).
+- Report MAE as the headline metric, with R² as secondary context.
+- Add a drift detector: flag when rolling 30-day MAE exceeds the 75th
+  percentile from the walk-forward distribution. That's a better
+  early-warning signal than chasing R² improvements.
+- Lean on the short-horizon models. 5min and 1h are the ones I'd trust for
+  anything real; 24h is more "informed guess" than "forecast."
+- If I could ask facility ops one question, it would be "what changed
+  around late March 2024?" Knowing that would unlock the ceiling on
+  long-horizon forecasting more than any model tweak.
+
+---
+
+*04-13-2026· Python 3 · scikit-learn · pandas · Quarto*

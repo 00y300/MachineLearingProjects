@@ -6,7 +6,7 @@ This repository contains machine learning experiments focused on Power Usage Eff
 
 **NLR HPC Facility Power Usage Effectiveness (PUE) Data**
 - **Publisher**: National Laboratory of the Rockies / NREL
-- **License**: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- **Dataset License**: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 - **Data Catalog**: [data.gov](https://catalog.data.gov/dataset/nlr-hpc-facility-power-usage-effectiveness-pue-data)
 - **Contact**: Struan Clark (Struan.Clark@nlr.gov)
 
