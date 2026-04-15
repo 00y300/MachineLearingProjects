@@ -43,7 +43,13 @@ The project is divided into two primary analytical pipelines:
 
 ## Data Management
 
-Raw data is downloaded from NREL and processed into a SQLite database (`power_data.db`) automatically when running the notebooks. The cleaning logic ensures physically impossible PUE values are removed before model training. Models expect features in `models/feature_columns.json`.
+Raw data is downloaded from NREL and processed into a SQLite database (`power_data.db`) automatically when running the notebooks. The cleaning logic ensures physically impossible PUE values are removed before model training. After notebook execution, the following directories will be populated:
+
+*   **`datasets/`**: SQLite database containing cleaned telemetry data
+*   **`models/`**: Serialized model artifacts (`.pkl`) and feature lists
+*   **`plots/`**: Generated visualizations for analysis reports
+
+Models expect features in `models/feature_columns.json`.
 
 To generate the dataset, train models, and create visualizations:
 ```bash
