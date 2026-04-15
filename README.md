@@ -6,12 +6,17 @@ This repository contains machine learning experiments focused on Power Usage Eff
 
 The project uses Nix Flakes for reproducible development environments. This configuration includes Python 3.13, PyTorch, scikit-learn, Jupyter/Quarto tools, and SQLite.
 
-To activate the environment on macOS:
+To activate the Nix environment:
 ```zsh
 nix develop --command zsh
 ```
 
-Once inside the shell, a virtual environment is automatically created at `.venv`. Ensure `quarto` is installed in the system path to render notebooks.
+Alternatively, create a virtual environment and install dependencies:
+```zsh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Directory Structure
 
@@ -42,10 +47,14 @@ Raw data is downloaded from NREL and processed into a SQLite database (`power_da
 
 To generate the dataset, train models, and create visualizations:
 ```bash
+# Using Quarto (requires quarto installed in PATH)
 quarto render notebooks/LinearRegression.qmd --to html
-```
+quarto render notebooks/Classification.qmd --to html
 
-This will download raw data, create the SQLite database, and save trained model artifacts to the respective directories. Ensure you have write permissions to `~/Documents/Projects/MachineLearningProjects/datasets` and `~/Documents/Projects/MachineLearningProjects/models`.
+# Or using Jupyter directly within the nix shell or venv
+jupyter lab notebooks/Classification.ipynb
+jupyter lab notebooks/LinearRegression.ipynb
+```
 
 ## Running Notebooks
 
